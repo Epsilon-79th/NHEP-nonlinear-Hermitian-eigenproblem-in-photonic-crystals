@@ -23,7 +23,13 @@ from pcfft import *
 from utils import *
 from lobpcg import *
 
+"""
+    Auxiliary internal functions for NEP iteration.
+"""
+
 def _update_diel(idx, eps):
+    # Update dielectric function handle.
+
     def diel_func_handle(x_in):
         x = x_in.copy()
         x[idx] *= eps
@@ -31,10 +37,11 @@ def _update_diel(idx, eps):
     return diel_func_handle
 
 def _rayleigh_ama(x_in, a_fft, idx, eps):
+    # Compute Rayleigh quotient x^H A x / x^H x, A is discrete curl.
+
     x = x_in.copy()
     n = round((x_in.size // 3)**(1/3))
     atx = A_block_kernel(x, -a_fft.conj())
-    #atx = cpx.scipy.fft.fftn(atx.reshape(n,n,n,3), axes = (0,1,2)).reshape(3*n*n*n,)
     matx = cp.zeros_like(atx)
     matx[idx] = atx[idx]
     temp = cp.cublas.dotc(atx, matx).real
@@ -49,6 +56,7 @@ def _rayleigh_ama(x_in, a_fft, idx, eps):
         return eps*temp
 
 def _newton_update_freq(mu, freq_pre, x, a_fft, idx, nep_func):
+    # Update frequency with one step of Newton iteration.
 
     freq_fpi = sqrt_robust(mu)
     dot_mu = _rayleigh_ama(x, a_fft, idx, nep_func.derivative(freq_pre)) - 2*freq_pre
@@ -61,8 +69,36 @@ def _newton_update_freq(mu, freq_pre, x, a_fft, idx, nep_func):
     else:
         return freq_fpi
 
+"""
+    Nonlinear iteration procedures.
+"""
+
 def fpi4nep(size, update_matrix, solver, nev, 
-            relaxtion = None, tol = TOL, newton_update = None, history = False):
+            relaxtion = None, tol = TOL, 
+            newton_update = None, history = False):
+    
+    """
+    Usage:
+        Use fixed-point (FP) or Newton iteration to solve NEPs.
+    
+    Input:
+        size(int):                  size of the problem.
+        update_matrix(func handle): frequency(float) --> matrix handle.
+        solver(func handle):        linear eigenproblem solver, 
+                                    (h_func_in, x0, nev) --> (lambdas_pnt, x, iters).
+        nev(int):                   number of eigenvalues to compute.
+        relaxtion(func handle):     optional, iteration number --> subspace dimension.
+        tol(float):                 optional, tolerance for convergence.
+        newton_update(func handle): optional, if None then FP else Newton iteration.
+        history(bool):              optional, whether to record convergence.
+    
+    Output:
+        freqs_nrmlzd(np.ndarray):   computed frequencies normalized by 2*pi.
+        eigvec(cp.ndarray):         computed eigenvectors.
+        info(np.ndarray):           iteration number and runtime for each eigenvalue.
+        history_nrm(np.ndarray):    optional, history of residual norms during iteration.
+    
+    """
 
     # Initialization.
     if relaxtion is None:
@@ -78,12 +114,14 @@ def fpi4nep(size, update_matrix, solver, nev,
     freq_pre = 0.0
 
     for i in range(nev):
-        runtime = 0.0
+        runtime = 0.0   # Runtime for current eigenvalue.
+
+        t_h = time.time()
         m = relaxtion(i+1)
-        if i < 1:
+        if i < 1:   
             x0 = cp.random.rand(size,m) + 1j * cp.random.rand(size,m)
         else:
-            # Optional.
+            # Extend initial guess.
             m0 = m - relaxtion(i)
             x0_extra = cp.random.rand(size,m0) + 1j*cp.random.rand(size,m0)
             x0_extra -= cp.cublas.gemm('N','N', x0, cp.cublas.gemm('H','N', x0, x0_extra))
@@ -92,19 +130,23 @@ def fpi4nep(size, update_matrix, solver, nev,
         matrix_handle = update_matrix(freq_pre)
         iter_fp = 0
         step_length = 10.0 # preset.
+        runtime += owari() - t_h    # Init runtime.
 
         while True:
             lambdas_pnt, x, iters = solver(h_func_in=matrix_handle, x0=x0, nev=i+1)
+            runtime += iters[1]
             while x is None:
+                # If solver fails, try random initial guess until success.
+                # The failure usually occurs on the first few iterations since x0 from previous iteration
+                # is "too close" to the current solution, causing NaN in Rayleigh-Ritz procedure.
                 cp.cuda.Device().synchronize()
                 print(f"{RED}Error occurs (nan or stagnation). Try random initial guess.{RESET}")
                 gc.collect() 
                 cp.get_default_memory_pool().free_all_blocks()
                 x0 = cp.random.rand(size,m) + 1j*cp.random.rand(size,m)
                 lambdas_pnt, x, iters = solver(h_func_in=matrix_handle, x0=x0, nev=i+1)
+                runtime += iters[1]
                 
-            runtime += iters[1]
-
             if step_length >= 1.0 or newton_update is None:
                 freq_new = sqrt_robust(lambdas_pnt[i])
             else:
@@ -116,6 +158,7 @@ def fpi4nep(size, update_matrix, solver, nev,
             iter_fp += 1
             step_length = cp.abs(freq_new - freq_pre)
 
+            # Optional relaxation.
             freq_new = freq_pre + 1.0*(freq_new - freq_pre)
             
             print(f"{CYAN}(i={i+1:3d}) Inner iter {iter_fp:2d}: residual = {res_nrm:<7.3e}, freq_nrmlzd = {freq_new/(2*pi):10.6f}, "
@@ -128,7 +171,7 @@ def fpi4nep(size, update_matrix, solver, nev,
             if res_nrm < tol:
                 break
 
-        # Store results.
+        # Record results.
         freq_pre = sqrt_robust(lambdas_pnt[i+1])
         freqs_nrmlzd[i] = freq_new/(2*pi)
         idx_his += iter_fp
@@ -143,6 +186,24 @@ def fpi4nep(size, update_matrix, solver, nev,
         return freqs_nrmlzd, eigvec, info
 
 def nep_1p(n = 120, d_flag = SC_F1, no = 20, nev = NEV, problem_type = "QUAD", newton = True, tol = None):
+
+    """
+    Usage:
+        Compute a single point in the band structure, with fixed-point iteration or Newton iteration.
+        One may save convergence history in a json file under "output/" by specifying a tolerance `tol`.
+
+    Input:
+        n(int):                    grid size along each axis.
+        d_flag(str):               lattice type, e.g. "SC_F1", "FCC", etc.
+        no(int or np.ndarray):     index of the point in the Brillouin zone, or numpy.ndarray of shape (3,).
+        nev(int):                  number of desired eigenvalues.
+        problem_type(str):         "QUAD" for quadratic NEP, "SiC" for SiC NEP (see environment).
+        newton(bool):              whether to use Newton iteration, if False then fixed-point iteration is used.
+        tol(float):                optional, if specified then convergence history will be recorded and saved.
+    
+    Output:
+        None.
+    """
 
     if isinstance(no, int):
         alpha_sample = diel.diel_alpha(d_flag, no)
@@ -189,6 +250,23 @@ def nep_1p(n = 120, d_flag = SC_F1, no = 20, nev = NEV, problem_type = "QUAD", n
     return
 
 def bandgap_nep(n=120, d_flag=SC_F1, problem_type="SiC", indices=None, newton = True):
+
+    """
+    Usage:
+        Compute the bandgap along the high-symmetry points in the Brillouin zone, with fixed-point iteration or Newton iteration.
+        The results will be saved in a json file under "output/" for future reference. 
+        If a previous record exists, the program will automatically compute those uncomputed or failed points.
+    
+    Input:
+        n(int):                    grid size along each axis.
+        d_flag(str):               lattice type, e.g. "SC_F1", "FCC", etc.
+        problem_type(str):         "QUAD" for quadratic NEP, "SiC" for SiC NEP (see environment).
+        indices(list of int):      optional, indices of the points in the Brillouin zone to compute, if None then all points will be computed.
+        newton(bool):              whether to use Newton iteration, if False then fixed-point iteration is used.
+    
+    Output:
+        err_index(list of int):    indices of the points where error occurs (e.g. convergence failure).
+    """
 
     # Fixed.
     gap = GAP
@@ -321,6 +399,21 @@ def bandgap_nep(n=120, d_flag=SC_F1, problem_type="SiC", indices=None, newton = 
 
 def precision_test(n=120, d_flag=SC_F1, problem_type="NEP_EPS_SiC", no=20, nev=10, tols = [1e-5, 1e-6, 1e-7]):
 
+    """
+    Usage:
+        Test the effect of different tolerances on the computed frequencies.
+    Input:
+        n(int):                    grid size along each axis.
+        d_flag(str):               lattice type, e.g. "SC_F1", "FCC", etc.
+        problem_type(str):         "QUAD" for quadratic NEP, "SiC" for SiC NEP (see environment).
+        no(int or np.ndarray):     index of the point in the Brillouin zone, or numpy.ndarray of shape (3,).
+        nev(int):                  number of desired eigenvalues.
+        tols(list of float):       list of tolerances to test.
+
+    Output:
+        None.
+    """
+
     n_tol = len(tols)
     freqs_all = np.zeros((nev, n_tol))
     info = np.zeros((nev, 2, n_tol))
@@ -353,8 +446,15 @@ def precision_test(n=120, d_flag=SC_F1, problem_type="NEP_EPS_SiC", no=20, nev=1
             print(f"[tol {tols[i]:.2e}] ({freqs_all[i,j]:12.6f}, {int(info[i,0,j]):3d}, {info[i,1,j]:6.2f}s.", end="\t")
     return
 
-# Read and output.
 def read_band_runtime(n, d_flag, problem_type):
+
+    """
+    Usage:
+        Output the runtime record of bandgap calculation for a completely calculated case.
+
+    Input:
+        n(int), d_flag(str), problem_type(str): specify the case to check, e.g. n=120, d_flag="SC_F1", problem_type="SiC".
+    """
 
     def _read_runtime(method):
         path_bandgap = OUTPUT_PATH + "bandgap_"+method+"_"+d_flag+'_NEP_EPS_'+problem_type+".json"

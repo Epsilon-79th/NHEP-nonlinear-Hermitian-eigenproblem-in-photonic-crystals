@@ -405,7 +405,7 @@ def lobpcg_sep_softlock(
         if cp.isnan(res_nrms).any():
             del x0, s, hs, ss, shs, res_his
             print(f"{RED}Nan occurs in residuals.{RESET}")
-            return None, None, None
+            return None, None, np.array([iter_, owari() - t_tot_h])
         if (iter_ > maxstagniter and (res_nrms[0] > 1000 or res_nrms[0] > res_his[1])) or \
             (iter_ > 2*maxstagniter and res_nrms[0] > 50):
             # Stagnation. (probably blowup, but nan does not occur)
@@ -413,7 +413,7 @@ def lobpcg_sep_softlock(
                 print(f"{YELLOW}Stagnation warning.{RESET}")
             else:
                 print(f"{YELLOW}Stagnation detected, probably blowup but no nan occurs.{RESET}")
-                return None, None, None
+                return None, None, np.array([iter_, owari() - t_tot_h])
         
         # Convergence.
         if max(res_nrms[:nev]) < tol:
@@ -454,14 +454,14 @@ def lobpcg_sep_softlock(
             del x0, s, hs, ss, shs, res_his
             gc.collect()
             pool.free_all_blocks()
-            return None, None, None
+            return None, None, np.array([iter_, owari() - t_tot_h])
 
         if cp.isnan(lambdas).any() or cp.isnan(eigvec).any():
             # Check nan.
             if longortho:
                 
                 print(f"{RED}Nan occurs in RR with long orthogonalization.{RESET}")
-                return None, None, None
+                return None, None, np.array([iter_, owari() - t_tot_h])
             #elif ~blowup:
             #    cp.get_default_memory_pool().free_all_blocks()
             #    lambdas, eigvec, t_rr = rayleigh_ritz_qr_sep(s[:,:n_loc], hs[:,:n_loc])
@@ -475,7 +475,7 @@ def lobpcg_sep_softlock(
                 gc.collect()
                 pool.free_all_blocks()
                 print(f"{RED}Nan occurs after Rayleigh-Ritz procedure.{RESET}")
-                return None, None, None
+                return None, None, np.array([iter_, owari() - t_tot_h])
         lambdas, eigvec = lambdas[:m], eigvec[:,:m]
             
         t_h = time.time()
@@ -496,8 +496,7 @@ def lobpcg_sep_softlock(
     
     del hs
     
-    t_tot_o = owari()
-    t_tot = t_tot_o - t_tot_h
+    t_tot = owari() - t_tot_h
     print(f"\nA complete procedure of lobpcg is done, {t_tot:<6.2f}s elapsed.")
 
     info = np.array([iter_, t_tot])
